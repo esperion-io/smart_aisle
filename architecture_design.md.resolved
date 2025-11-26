@@ -1,0 +1,139 @@
+# Supermarket Promotional Item Recommendation — Architecture Design
+
+## 1. High-Level Architecture Overview
+
+This architecture is designed for **simplicity, scalability, and speed of experimentation**. It leverages a "Modern Data Stack" approach on Google Cloud Platform (GCS + BigQuery + Vertex AI).
+
+### Core Philosophy
+- **ELT over ETL**: Load raw data into BigQuery first, then transform it using SQL. This is more maintainable than complex Python ETL scripts for this scale.
+- **BigQuery as the Hub**: BigQuery will serve as the central repository for raw data, cleaned data, features, and even model predictions.
+- **Vertex AI for Intelligence**: We use Vertex AI specifically for the "reasoning" layer—fine-tuning Gemini to understand product context and rank items based on the complex multi-variable criteria (margins, cannibalization, etc.).
+
+---
+
+## 2. Process Flow Diagram
+
+```mermaid
+graph TD
+    subgraph DataIngestion ["Data Ingestion (GCS)"]
+        A["Supermarket Data Files<br/>(CSV/Parquet)"] -->|Upload| B["GCS Bucket<br/>Landing Zone"]
+    end
+
+    subgraph BigQueryProcessing ["Data Warehousing & Processing (BigQuery)"]
+        B -->|"BigQuery Data Transfer<br/>or External Tables"| C["Raw Tables<br/>(Bronze Layer)"]
+        C -->|"SQL Transformations"| D["Cleaned Data<br/>(Silver Layer)"]
+        D -->|"Feature Engineering SQL"| E["Feature Store / Gold Tables"]
+        
+        E -->|"Historical Promo Data"| F["Training Dataset"]
+        E -->|"Current Inventory & Metrics"| G["Inference Dataset"]
+    end
+
+    subgraph VertexAI ["AI/ML (Vertex AI)"]
+        F -->|"Fine-tuning Job"| H["Vertex AI<br/>Gemini 2.5 Pro / 3"]
+        H -->|"Registered Model"| I["Model Registry"]
+        
+        subgraph ValidationLoop ["Validation & Backtesting"]
+            I -->|"Load Candidate Model"| V1["Backtesting Engine<br/>(Vertex Pipelines)"]
+            E -->|"Historical Validation Set"| V1
+            V1 -->|"Generate Metrics<br/>(Lift, Cannibalization)"| V2["Validation Report"]
+        end
+        
+        V2 -->|"If Pass Thresholds"| J["Approved for Inference"]
+        G -->|"Batch Prediction Request"| J
+        J -->|"Ranked Recommendations"| K["Predictions"]
+    end
+
+    subgraph OutputGen ["Output Generation (BigQuery)"]
+        K -->|"Load Results"| L["Recommendation Results Table"]
+        L -->|"SQL Aggregation"| M["Final Dashboards/Exports"]
+    end
+
+    M --> O1["1. Top 50-100 Revenue Impact"]
+    M --> O2["2. High Margin Bestsellers"]
+    M --> O3["3. Location-Based Perf"]
+    M --> O4["4. Optimal Pricing"]
+    M --> O5["5. Category Margin Ratio"]
+    M --> O6["6. Ensemble Database"]
+```
+
+---
+
+## 3. Component Details
+
+### A. Data Storage: Google Cloud Storage (GCS)
+**Role**: Landing zone for raw files.
+- **Structure**:
+    - `gs://<project-id>-data-landing/sales/YYYY-MM-DD/`
+    - `gs://<project-id>-data-landing/inventory/YYYY-MM-DD/`
+    - `gs://<project-id>-data-landing/transactions/YYYY-MM-DD/`
+- **Rationale**: Decouples upload from processing. Provides a durable backup of raw inputs.
+
+### B. Data Processing & Feature Engineering: BigQuery
+**Role**: The heavy lifter for data cleaning, transformation, and feature calculation.
+- **Ingestion**: Use BigQuery Data Transfer Service or simple `bq load` commands to ingest from GCS to "Raw" tables.
+- **Transformation (SQL)**:
+    - **Cleaning**: Handle missing values, standardize product IDs.
+    - **Metrics Calculation**:
+        - *Units Sold*: Sum of quantity.
+        - *Revenue*: Sum of (Price * Quantity).
+        - *Margin*: (Price - Cost) / Price.
+        - *Cannibalization Proxy*: Correlation of sales between items in the same sub-category.
+- **Feature Table Creation**: Create a wide table for the model input:
+    - `item_id`, `category`, `current_price`, `cost`, `avg_weekly_sales`, `price_elasticity_score`, `promo_history_flag`, `competitor_price_index`.
+
+### C. Model Training & Inference: Vertex AI
+**Role**: The "Brain" for ranking and reasoning.
+- **Model Selection**: **Gemini 2.5 Pro** (balanced for complex reasoning and cost).
+- **Training Strategy**: **Supervised Fine-Tuning (SFT)**.
+    - *Input*: Historical weeks' data (features) + "Context" (e.g., "This item is a summer seasonal product").
+    - *Target*: "Success Score" (a composite metric of Revenue Lift + Margin Dollar Lift).
+    - *Prompt*: "Given the sales metrics and category context for item X, predict its suitability for a front-store promotion on a scale of 1-10 and explain why."
+- **Inference**: Weekly Batch Prediction Job.
+    - Feed the current week's candidate items (top 500 by raw volume) into the model to get the refined top 50-100 with reasoning.
+
+### D. Validation & Backtesting Framework (CRITICAL)
+**Role**: Ensure model reliability before any recommendation reaches a store.
+- **Backtesting Strategy**: **Time-Series Split**.
+    - Train on weeks `1` to `N`.
+    - Test on week `N+1` (which has already happened).
+    - Compare *Predicted Rank* vs *Actual Realized Margin Lift*.
+- **Key Validation Metrics**:
+    1.  **NDCG (Normalized Discounted Cumulative Gain)**: Measures if the model correctly ranked the highest-performing items at the top.
+    2.  **Precision@50**: What % of the model's top 50 recommendations actually resulted in positive margin growth?
+    3.  **Cannibalization Check**: If the model recommends Item A, did the *Category* margin decrease in the test week? If yes, flag as high risk.
+- **Implementation**:
+    - **Vertex AI Pipelines**: A pipeline that runs automatically after every training job.
+    - **Gatekeeper**: If `Precision@50 < Threshold` or `Cannibalization Risk > Threshold`, the model is **rejected** and does not proceed to inference.
+
+### E. Model Registry & Deployment
+- **Vertex AI Model Registry**: Store fine-tuned adapter versions. Tag them as `prod`, `staging`, etc.
+- **Deployment**: Since this is a weekly batch process, we **do not** need a real-time endpoint (saving significant cost). We use **Vertex AI Batch Prediction** jobs triggered by a Cloud Scheduler or Airflow (Cloud Composer).
+
+---
+
+## 4. Addressing Required Outputs
+
+All outputs are derived from the final `Recommendation Results Table` in BigQuery, which joins the Model Predictions back with the detailed metadata.
+
+1.  **Top 50-100 Products by Revenue Impact**:
+    - *Query*: Select top items ordered by `predicted_revenue_lift`.
+2.  **Highest Margin Bestsellers**:
+    - *Query*: Filter for `margin > X%` AND `sales_velocity > Y`, then rank by model score.
+3.  **Location-Based Performance**:
+    - *Query*: Group by `store_zone` or `region_id` if location data is available in the transaction logs.
+4.  **Optimal Promotional Pricing**:
+    - *Approach*: During inference, we can pass 3 different price points (e.g., 10%, 15%, 20% off) for each item to the model and see which one yields the highest `predicted_margin_dollars`. Select the winner.
+5.  **Revenue-to-Category Margin Ratio**:
+    - *Query*: Calculate `(Item Promo Revenue) / (Total Category Margin during Promo Period)`. High ratio = good; Low ratio = cannibalization.
+6.  **Ensemble Recommendation Database**:
+    - *Final Table*: A materialized view in BigQuery containing all columns: `item_id`, `rank`, `reasoning`, `optimal_price`, `expected_lift`, `cannibalization_risk`.
+
+---
+
+## 5. Implementation Roadmap (MVP)
+
+1.  **Week 1**: Set up GCS buckets and BigQuery schemas. Ingest 1 year of historical data.
+2.  **Week 2**: Write SQL for basic metrics (Margin, Velocity) and create the "Feature Table".
+3.  **Week 3**: **Build Backtesting Pipeline**. Implement the time-series split and validation metrics in Vertex AI.
+4.  **Week 4**: Fine-tune Gemini 2.5 Pro and run it through the Backtesting Pipeline.
+5.  **Week 5**: Run batch predictions for the live week and generate final outputs.
